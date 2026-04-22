@@ -21,7 +21,7 @@ class LLMClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: float = 300.0
+        timeout: float = float(os.environ.get("LLM_TIMEOUT", "900"))
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
@@ -38,7 +38,7 @@ class LLMClient:
 
         # Ollama context window size — prevents prompt truncation.
         # Read from env OLLAMA_NUM_CTX, default 8192 (Ollama default is only 2048).
-        self._num_ctx = int(os.environ.get('OLLAMA_NUM_CTX', '8192'))
+        self._num_ctx = int(os.environ.get('OLLAMA_NUM_CTX', '4096'))
 
     def _is_ollama(self) -> bool:
         """Check if we're talking to an Ollama server."""

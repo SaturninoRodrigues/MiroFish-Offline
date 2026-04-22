@@ -48,13 +48,7 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # GPU removed - Mac Intel has no NVIDIA GPU, runs on CPU
 
 volumes:
   neo4j_data:
