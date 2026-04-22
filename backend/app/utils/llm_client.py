@@ -38,7 +38,7 @@ class LLMClient:
 
         # Ollama context window size — prevents prompt truncation.
         # Read from env OLLAMA_NUM_CTX, default 8192 (Ollama default is only 2048).
-        self._num_ctx = int(os.environ.get('OLLAMA_NUM_CTX', '4096'))
+        self._num_ctx = int(os.environ.get('OLLAMA_NUM_CTX', '8192'))
 
     def _is_ollama(self) -> bool:
         """Check if we're talking to an Ollama server."""
@@ -85,6 +85,59 @@ class LLMClient:
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
         return content
 
+    def _repair_json(self, raw: str) -> Optional[Dict[str, Any]]:
+        """
+        Attempt to extract valid JSON from malformed LLM output.
+        Handles: truncated output, trailing garbage, missing closing braces.
+        """
+        # 1. Try to find the outermost { ... } block
+        start = raw.find('{')
+        if start == -1:
+            return None
+
+        candidate = raw[start:]
+
+        # 2. Try parsing as-is
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        # 3. Try closing unclosed braces/brackets
+        # Count open vs close
+        open_braces = candidate.count('{') - candidate.count('}')
+        open_brackets = candidate.count('[') - candidate.count(']')
+
+        # Strip trailing partial tokens (incomplete strings, trailing commas)
+        repaired = candidate.rstrip()
+        # Remove trailing comma before we close
+        repaired = re.sub(r',\s*$', '', repaired)
+        # Remove incomplete string at end (open quote without close)
+        repaired = re.sub(r'"[^"]*$', '""', repaired)
+
+        repaired += ']' * max(0, open_brackets)
+        repaired += '}' * max(0, open_braces)
+
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
+        # 4. Aggressive: find the largest parseable JSON prefix
+        for end in range(len(candidate), start, -1):
+            snippet = candidate[:end]
+            ob = snippet.count('{') - snippet.count('}')
+            ol = snippet.count('[') - snippet.count(']')
+            snippet = re.sub(r',\s*$', '', snippet.rstrip())
+            snippet += ']' * max(0, ol)
+            snippet += '}' * max(0, ob)
+            try:
+                return json.loads(snippet)
+            except json.JSONDecodeError:
+                continue
+
+        return None
+
     def chat_json(
         self,
         messages: List[Dict[str, str]],
@@ -117,4 +170,12 @@ class LLMClient:
         try:
             return json.loads(cleaned_response)
         except json.JSONDecodeError:
-            raise ValueError(f"Invalid JSON format from LLM: {cleaned_response}")
+            # Attempt JSON repair for truncated/malformed output
+            repaired = self._repair_json(cleaned_response)
+            if repaired is not None:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "LLM returned malformed JSON — repaired successfully"
+                )
+                return repaired
+            raise ValueError(f"Invalid JSON format from LLM: {cleaned_response[:500]}")

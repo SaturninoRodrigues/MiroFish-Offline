@@ -4,11 +4,26 @@ Interface 1: Analyze text content and generate entity and relationship type defi
 """
 
 import json
+import os
 from typing import Dict, Any, List, Optional
 from ..utils.llm_client import LLMClient
 
 
-# System prompt for ontology generation
+# Compact system prompt for small models (< 3B params).
+# Fits comfortably in 4-8K context with room for user text + response.
+ONTOLOGY_SYSTEM_PROMPT_COMPACT = """You are an ontology designer. Analyze text and output ONLY valid JSON with this structure:
+
+{"entity_types":[{"name":"PascalCase","description":"<100 chars","attributes":[{"name":"snake_case (NOT name/uuid/group_id/created_at/summary)","type":"text","description":"desc"}],"examples":["ex1"]}],"edge_types":[{"name":"UPPER_SNAKE_CASE","description":"<100 chars","source_targets":[{"source":"EntityType","target":"EntityType"}],"attributes":[]}],"analysis_summary":"brief summary"}
+
+Rules:
+- Exactly 10 entity_types. First 8 specific, last 2 MUST be Person and Organization as fallbacks.
+- 6-10 edge_types for social media interactions.
+- Entities must be real actors (people, companies, media, government), NOT abstract concepts.
+- 1-3 attributes per entity. Use full_name/role/title, never reserved words (name, uuid, group_id, created_at, summary).
+- Output ONLY the JSON object, no explanation."""
+
+
+# Full system prompt for capable models (7B+)
 ONTOLOGY_SYSTEM_PROMPT = """You are a professional knowledge graph ontology design expert. Your task is to analyze given text content and simulation requirements, and design entity types and relationship types suitable for **social media opinion simulation**.
 
 **Important: You must output valid JSON format data, do not output anything else.**
@@ -164,6 +179,15 @@ class OntologyGenerator:
     def __init__(self, llm_client: Optional[LLMClient] = None):
         self.llm_client = llm_client or LLMClient()
 
+    def _use_compact_prompt(self) -> bool:
+        """Use compact prompt for small models (1.5B, 3B) that struggle with long prompts."""
+        model = (self.llm_client.model or '').lower()
+        # Match small quantized/param models: 1.5b, 3b, 0.5b, 1b
+        for tag in [':0.5b', ':1b', ':1.5b', ':3b', '-0.5b', '-1b', '-1.5b', '-3b']:
+            if tag in model:
+                return True
+        return False
+
     def generate(
         self,
         document_texts: List[str],
@@ -181,6 +205,9 @@ class OntologyGenerator:
         Returns:
             Ontology definition (entity_types, edge_types, etc.)
         """
+        compact = self._use_compact_prompt()
+        system_prompt = ONTOLOGY_SYSTEM_PROMPT_COMPACT if compact else ONTOLOGY_SYSTEM_PROMPT
+
         # Build user message
         user_message = self._build_user_message(
             document_texts,
@@ -188,8 +215,15 @@ class OntologyGenerator:
             additional_context
         )
 
+        # For compact mode, truncate user message to leave room for response
+        if compact:
+            # Reserve ~2K tokens for response in 8K context
+            max_user_chars = 4000
+            if len(user_message) > max_user_chars:
+                user_message = user_message[:max_user_chars] + "\n\n(text truncated for model context limit)"
+
         messages = [
-            {"role": "system", "content": ONTOLOGY_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ]
 
@@ -269,6 +303,18 @@ Based on the above content, design entity types and relationship types suitable 
         for entity in result["entity_types"]:
             if "attributes" not in entity:
                 entity["attributes"] = []
+            # Normalize attributes: small models may return ["name1", "name2"] instead of [{name, type, desc}]
+            normalized_attrs = []
+            for attr in entity["attributes"]:
+                if isinstance(attr, str):
+                    normalized_attrs.append({
+                        "name": attr,
+                        "type": "text",
+                        "description": attr.replace("_", " ")
+                    })
+                elif isinstance(attr, dict):
+                    normalized_attrs.append(attr)
+            entity["attributes"] = normalized_attrs
             if "examples" not in entity:
                 entity["examples"] = []
             # Ensure description doesn't exceed 100 characters
@@ -277,6 +323,13 @@ Based on the above content, design entity types and relationship types suitable 
 
         # Validate relationship types
         for edge in result["edge_types"]:
+            # Normalize edge name to UPPER_SNAKE_CASE (small models may use PascalCase)
+            name = edge.get("name", "")
+            if name and not name.isupper():
+                # Convert PascalCase/camelCase to UPPER_SNAKE_CASE
+                import re as _re
+                name = _re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', name)
+                edge["name"] = name.upper()
             if "source_targets" not in edge:
                 edge["source_targets"] = []
             if "attributes" not in edge:
